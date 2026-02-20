@@ -130,26 +130,55 @@ print(f'Merged {len(merged_list)} total allowlist entries')
     fi
 }
 
-# ---------- Layer 2 + 3: Skill ----------
+# ---------- Layer 2: Shell replacement (THE REAL ENFORCEMENT) ----------
+install_shell_intercept() {
+    log_step "Layer 2: Installing SafeSkill shell interceptor..."
+
+    local shell_src="$SCRIPT_DIR/safeskill-shell"
+    local shell_dst="/usr/local/bin/safeskill-shell"
+
+    if [[ ! -f "$shell_src" ]]; then
+        log_error "safeskill-shell not found at $shell_src"
+        return 1
+    fi
+
+    # Install to /usr/local/bin (may need sudo - try both)
+    if cp "$shell_src" "$shell_dst" 2>/dev/null; then
+        chmod +x "$shell_dst"
+        log_info "Shell interceptor installed at $shell_dst"
+    elif sudo cp "$shell_src" "$shell_dst" 2>/dev/null; then
+        sudo chmod +x "$shell_dst"
+        log_info "Shell interceptor installed at $shell_dst (via sudo)"
+    else
+        # Fallback: install in user's local bin
+        local user_bin="$HOME/.local/bin"
+        mkdir -p "$user_bin"
+        cp "$shell_src" "$user_bin/safeskill-shell"
+        chmod +x "$user_bin/safeskill-shell"
+        shell_dst="$user_bin/safeskill-shell"
+        log_warn "Could not install to /usr/local/bin. Installed at $shell_dst"
+    fi
+
+    SAFESKILL_SHELL_PATH="$shell_dst"
+    log_info "Shell interceptor ready: $SAFESKILL_SHELL_PATH"
+}
+
+# ---------- Layer 3: Skill ----------
 install_skill() {
-    log_step "Layer 2+3: Installing SafeSkill skill..."
+    log_step "Layer 3: Installing SafeSkill skill..."
 
     mkdir -p "$SKILL_DIR"
 
-    # Copy SKILL.md (Layer 3: LLM prompt instructions)
     cp "$SCRIPT_DIR/SKILL.md" "$SKILL_DIR/SKILL.md"
     log_info "SKILL.md installed at $SKILL_DIR/SKILL.md"
 
-    # Copy exec wrapper (Layer 2: shell interception)
-    cp "$SCRIPT_DIR/safeskill-exec.sh" "$SKILL_DIR/safeskill-exec.sh"
-    chmod +x "$SKILL_DIR/safeskill-exec.sh"
-    log_info "safeskill-exec.sh installed at $SKILL_DIR/safeskill-exec.sh"
-
-    # Copy the original wrapper too for direct invocation
-    if [[ -f "$SCRIPT_DIR/safeskill-wrapper.sh" ]]; then
-        cp "$SCRIPT_DIR/safeskill-wrapper.sh" "$SKILL_DIR/safeskill-wrapper.sh"
-        chmod +x "$SKILL_DIR/safeskill-wrapper.sh"
-    fi
+    # Copy wrappers for direct invocation
+    for f in safeskill-exec.sh safeskill-wrapper.sh; do
+        if [[ -f "$SCRIPT_DIR/$f" ]]; then
+            cp "$SCRIPT_DIR/$f" "$SKILL_DIR/$f"
+            chmod +x "$SKILL_DIR/$f"
+        fi
+    done
 }
 
 # ---------- Layer 4: Hook ----------
@@ -187,8 +216,12 @@ configure_openclaw() {
         configured=true
     fi
 
-    # Method 2: Direct config.json write/merge (always run as backup)
-    log_info "Ensuring config.json has exec enforcement settings..."
+    # Method 2: Direct config write — SET SHELL TO OUR INTERCEPTOR
+    # This is the REAL enforcement. OpenClaw uses $SHELL to run commands.
+    # By setting SHELL to safeskill-shell, every command goes through us.
+    log_info "Writing SHELL override and exec settings to OpenClaw config..."
+
+    local shell_path="${SAFESKILL_SHELL_PATH:-/usr/local/bin/safeskill-shell}"
 
     python3 -c "
 import json, os
@@ -203,12 +236,32 @@ if os.path.exists(config_path):
     except (json.JSONDecodeError, IOError):
         config = {}
 
-# Ensure tools.exec section exists with security settings
+# Set SHELL to safeskill-shell in the env block
+# This is the REAL enforcement — OpenClaw uses SHELL for exec
+env_block = config.setdefault('env', {})
+env_block['SHELL'] = '${shell_path}'
+env_block['SAFESKILL_REAL_SHELL'] = '/bin/bash'
+env_block['SAFESKILL_SOCKET'] = '/tmp/safeskill.sock'
+
+# Also set in .env file as backup
+env_file = os.path.join(os.path.dirname(config_path), '.env')
+env_lines = []
+if os.path.exists(env_file):
+    with open(env_file, 'r') as f:
+        env_lines = [l for l in f.readlines()
+                     if not l.startswith('SHELL=')
+                     and not l.startswith('SAFESKILL_')]
+
+env_lines.append('SHELL=${shell_path}\n')
+env_lines.append('SAFESKILL_REAL_SHELL=/bin/bash\n')
+env_lines.append('SAFESKILL_SOCKET=/tmp/safeskill.sock\n')
+
+with open(env_file, 'w') as f:
+    f.writelines(env_lines)
+
+# Also set exec tool config as defense-in-depth
 tools = config.setdefault('tools', {})
 exec_cfg = tools.setdefault('exec', {})
-
-# CRITICAL: host must be 'gateway' for exec-approvals to apply
-# Without this, commands run in sandbox mode which skips approvals entirely
 exec_cfg.setdefault('host', 'gateway')
 exec_cfg.setdefault('security', 'allowlist')
 exec_cfg.setdefault('ask', 'on-miss')
@@ -217,29 +270,28 @@ exec_cfg.setdefault('askFallback', 'deny')
 with open(config_path, 'w') as f:
     json.dump(config, f, indent=2)
 
-print(f'Config written: host={exec_cfg[\"host\"]}, security={exec_cfg[\"security\"]}')
-" 2>/dev/null && configured=true || log_warn "Could not write config.json"
+print(f'SHELL set to: ${shell_path}')
+print(f'exec: host={exec_cfg[\"host\"]}, security={exec_cfg[\"security\"]}')
+" 2>/dev/null && configured=true || log_warn "Could not write config"
 
     if [[ "$configured" == true ]]; then
-        log_info "OpenClaw exec enforcement configured"
-        log_info "IMPORTANT: host=gateway ensures exec-approvals are enforced"
+        log_info "SHELL override configured — OpenClaw will use safeskill-shell"
+        log_info "This means EVERY command goes through SafeSkillAgent"
         log_info "IMPORTANT: Restart OpenClaw for changes to take effect"
     else
         log_error "Could not configure OpenClaw automatically."
-        log_error "You MUST add this to ~/.openclaw/config.json manually:"
-        echo ""
-        echo '  {'
-        echo '    "tools": {'
-        echo '      "exec": {'
-        echo '        "host": "gateway",'
-        echo '        "security": "allowlist",'
-        echo '        "ask": "on-miss",'
-        echo '        "askFallback": "deny"'
-        echo '      }'
-        echo '    }'
-        echo '  }'
-        echo ""
-        log_error "Without host=gateway, OpenClaw runs commands WITHOUT approval checks!"
+        log_error ""
+        log_error "You MUST do this manually:"
+        log_error ""
+        log_error "  Option A: Add to ~/.openclaw/openclaw.json:"
+        log_error '    { "env": { "SHELL": "'$shell_path'" } }'
+        log_error ""
+        log_error "  Option B: Add to ~/.openclaw/.env:"
+        log_error "    SHELL=$shell_path"
+        log_error ""
+        log_error "  Option C: Start OpenClaw with:"
+        log_error "    SHELL=$shell_path openclaw start"
+        log_error ""
     fi
 }
 
@@ -252,29 +304,49 @@ verify() {
     if [[ -f "$OPENCLAW_DIR/exec-approvals.json" ]]; then
         log_info "Layer 1 (exec-approvals): OK"
     else
-        log_error "Layer 1 (exec-approvals): MISSING"
-        ok=false
+        log_warn "Layer 1 (exec-approvals): MISSING (secondary defense)"
+        # Not fatal — shell intercept is the primary
     fi
 
-    if [[ -f "$SKILL_DIR/safeskill-exec.sh" ]] && [[ -x "$SKILL_DIR/safeskill-exec.sh" ]]; then
-        log_info "Layer 2 (exec wrapper): OK"
+    local shell_path="${SAFESKILL_SHELL_PATH:-/usr/local/bin/safeskill-shell}"
+    if [[ -x "$shell_path" ]]; then
+        log_info "Layer 2 (SHELL interceptor): OK — $shell_path"
+
+        # Check if OpenClaw config has SHELL set
+        if [[ -f "$OPENCLAW_DIR/openclaw.json" ]]; then
+            if python3 -c "
+import json
+with open('${OPENCLAW_DIR}/openclaw.json') as f:
+    c = json.load(f)
+shell = c.get('env',{}).get('SHELL','')
+exit(0 if 'safeskill' in shell else 1)
+" 2>/dev/null; then
+                log_info "Layer 2 (SHELL in config): OK — OpenClaw will use safeskill-shell"
+            else
+                log_error "Layer 2 (SHELL in config): NOT SET — OpenClaw will bypass SafeSkill!"
+                ok=false
+            fi
+        elif [[ -f "$OPENCLAW_DIR/.env" ]] && grep -q "SHELL=.*safeskill" "$OPENCLAW_DIR/.env" 2>/dev/null; then
+            log_info "Layer 2 (SHELL in .env): OK"
+        else
+            log_error "Layer 2 (SHELL config): NOT SET — run configure_openclaw"
+            ok=false
+        fi
     else
-        log_error "Layer 2 (exec wrapper): MISSING"
+        log_error "Layer 2 (SHELL interceptor): NOT INSTALLED at $shell_path"
         ok=false
     fi
 
     if [[ -f "$SKILL_DIR/SKILL.md" ]]; then
         log_info "Layer 3 (skill prompt): OK"
     else
-        log_error "Layer 3 (skill prompt): MISSING"
-        ok=false
+        log_warn "Layer 3 (skill prompt): MISSING (soft defense)"
     fi
 
     if [[ -f "$HOOK_DIR/handler.ts" ]] && [[ -f "$HOOK_DIR/HOOK.md" ]]; then
         log_info "Layer 4 (bootstrap hook): OK"
     else
-        log_error "Layer 4 (bootstrap hook): MISSING"
-        ok=false
+        log_warn "Layer 4 (bootstrap hook): MISSING (secondary defense)"
     fi
 
     if [[ "$ok" == true ]]; then
@@ -305,6 +377,8 @@ main() {
 
     check_prerequisites
     echo ""
+    install_shell_intercept
+    echo ""
     install_exec_approvals
     echo ""
     install_skill
@@ -318,17 +392,31 @@ main() {
     echo ""
     echo "============================================"
     echo ""
-    echo "  Next steps:"
+    echo "  HOW IT WORKS:"
+    echo ""
+    echo "  OpenClaw uses SHELL to run commands."
+    echo "  We replaced SHELL with safeskill-shell."
+    echo "  Now EVERY command goes through SafeSkillAgent."
+    echo "  The LLM cannot bypass this — it's in the execution path."
+    echo ""
+    echo "  NEXT STEPS:"
     echo ""
     echo "  1. Make sure SafeSkillAgent daemon is running:"
     echo "       safeskill start"
     echo ""
-    echo "  2. Restart OpenClaw to pick up the new skill + hook:"
+    echo "  2. RESTART OpenClaw (REQUIRED for SHELL change to take effect):"
     echo "       openclaw stop && openclaw start"
     echo ""
     echo "  3. Test it — tell OpenClaw:"
     echo "       \"run rm -rf /tmp/test\""
-    echo "     It should be BLOCKED at multiple layers."
+    echo "     OpenClaw will see: [SafeSkill] BLOCKED"
+    echo ""
+    echo "  IF IT STILL DOESN'T WORK:"
+    echo "     Verify: grep SHELL ~/.openclaw/.env"
+    echo "     Should show: SHELL=/usr/local/bin/safeskill-shell"
+    echo ""
+    echo "     Or start OpenClaw manually:"
+    echo "     SHELL=/usr/local/bin/safeskill-shell openclaw start"
     echo ""
     echo "============================================"
     echo ""
