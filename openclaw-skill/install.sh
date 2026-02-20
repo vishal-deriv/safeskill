@@ -223,23 +223,43 @@ configure_openclaw() {
 
     local shell_path="${SAFESKILL_SHELL_PATH:-/usr/local/bin/safeskill-shell}"
 
-    log_info "Setting SHELL override for OpenClaw..."
+    # PRIMARY METHOD: BASH_ENV trap injection
+    # OpenClaw ignores SHELL overrides. But when it runs bash -c "command",
+    # bash sources the file in BASH_ENV before executing. We put a DEBUG trap
+    # there that checks every command with SafeSkillAgent.
+    # With extdebug, returning non-zero from DEBUG trap PREVENTS execution.
 
-    # Write to .env (OpenClaw loads this but won't override existing SHELL)
+    local trap_src="$SCRIPT_DIR/safeskill-trap.sh"
+    local trap_dst="/opt/safeskill/safeskill-trap.sh"
+
+    if [[ -f "$trap_src" ]]; then
+        sudo cp "$trap_src" "$trap_dst" 2>/dev/null || cp "$trap_src" "$trap_dst" 2>/dev/null || {
+            trap_dst="$OPENCLAW_DIR/safeskill-trap.sh"
+            cp "$trap_src" "$trap_dst"
+        }
+        chmod 644 "$trap_dst"
+        log_info "Trap script installed at $trap_dst"
+    fi
+
+    local shell_path="${SAFESKILL_SHELL_PATH:-/usr/local/bin/safeskill-shell}"
+
+    # Write to .env — BASH_ENV is the critical one
     local env_file="$OPENCLAW_DIR/.env"
     local env_lines=()
     if [[ -f "$env_file" ]]; then
         while IFS= read -r line; do
             [[ "$line" == SHELL=* ]] && continue
             [[ "$line" == SAFESKILL_* ]] && continue
+            [[ "$line" == BASH_ENV=* ]] && continue
             env_lines+=("$line")
         done < "$env_file"
     fi
+    env_lines+=("BASH_ENV=$trap_dst")
+    env_lines+=("SAFESKILL_SOCKET=/tmp/safeskill.sock")
     env_lines+=("SHELL=$shell_path")
     env_lines+=("SAFESKILL_REAL_SHELL=/bin/bash")
-    env_lines+=("SAFESKILL_SOCKET=/tmp/safeskill.sock")
     printf '%s\n' "${env_lines[@]}" > "$env_file"
-    log_info "Updated $env_file"
+    log_info "Updated $env_file with BASH_ENV=$trap_dst"
 
     # Write to config json
     python3 -c "
@@ -255,9 +275,10 @@ if os.path.exists(config_path):
         config = {}
 
 env_block = config.setdefault('env', {})
+env_block['BASH_ENV'] = '${trap_dst}'
+env_block['SAFESKILL_SOCKET'] = '/tmp/safeskill.sock'
 env_block['SHELL'] = '${shell_path}'
 env_block['SAFESKILL_REAL_SHELL'] = '/bin/bash'
-env_block['SAFESKILL_SOCKET'] = '/tmp/safeskill.sock'
 
 tools = config.setdefault('tools', {})
 exec_cfg = tools.setdefault('exec', {})
