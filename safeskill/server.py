@@ -90,7 +90,9 @@ class SafeSkillServer:
         await unix_site.start()
 
         try:
-            os.chmod(socket_path, stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP | stat.S_IWGRP)
+            # Socket must be world-readable/writable so non-root OpenClaw can connect.
+            # The socket only accepts JSON evaluation requests -- no shell access.
+            os.chmod(socket_path, 0o666)
         except OSError:
             pass
 
