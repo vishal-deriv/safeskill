@@ -228,6 +228,23 @@ setup_config() {
 
     "$VENV_DIR/bin/safeskill" init --config-dir "$CONFIG_DIR"
 
+    # Capture hostname, user, IP for SIEM logs (one-time at install)
+    local hname user ip
+    hname=$(hostname 2>/dev/null || uname -n 2>/dev/null)
+    user="${SUDO_USER:-$(logname 2>/dev/null)}"
+    [[ -z "$user" ]] && user="root"
+    ip=$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || true)
+    [[ -z "$ip" ]] && ip="127.0.0.1"
+
+    local agent_yaml="$CONFIG_DIR/agent.yaml"
+    {
+        [[ -f "$agent_yaml" ]] && grep -v '^default_hostname:\|^default_user:\|^default_source_ip:' "$agent_yaml"
+        echo "default_hostname: $hname"
+        echo "default_user: $user"
+        echo "default_source_ip: $ip"
+    } > "${agent_yaml}.tmp" && mv "${agent_yaml}.tmp" "$agent_yaml"
+    log_info "SIEM metadata: hostname=$hname user=$user source_ip=$ip"
+
     chown -R root:wheel "$CONFIG_DIR"
     chmod 750 "$CONFIG_DIR"
     chmod 640 "$CONFIG_DIR"/*.yaml 2>/dev/null || true

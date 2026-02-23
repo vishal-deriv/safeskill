@@ -138,7 +138,7 @@ class SafeSkillServer:
             )
 
         result = self._evaluator.evaluate(eval_request)
-        self._audit.log_evaluation(result, source=eval_request.source)
+        self._audit.log_evaluation(result, source=eval_request.source, user=eval_request.user)
 
         return web.json_response({
             "verdict": result.verdict.value,

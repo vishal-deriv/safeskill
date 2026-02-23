@@ -75,7 +75,8 @@ class CommandEvaluator:
             r"(curl|wget|nc|ncat)\s+.*(-d\s+@/etc/passwd|-d\s+@/etc/shadow)", re.IGNORECASE
         ),
         re.compile(r"tar\s+.*\|\s*(curl|wget|nc)\s+", re.IGNORECASE),
-        re.compile(r"cat\s+/etc/(passwd|shadow|hosts)\s*\|", re.IGNORECASE),
+        re.compile(r"cat\s+/etc/(passwd|shadow)(\s*\||\s*$)", re.IGNORECASE),  # plain or piped
+        re.compile(r"cat\s+/etc/hosts\s*\|", re.IGNORECASE),
         re.compile(r"scp\s+/etc/(passwd|shadow)\s+", re.IGNORECASE),
     ]
     PRIVILEGE_ESCALATION = [
@@ -121,7 +122,6 @@ class CommandEvaluator:
         self._trust = trust_enforcer
 
     def evaluate(self, request: EvaluationRequest) -> EvaluationResult:
-        """Evaluate a command and return a verdict. NEVER executes the command."""
         start = time.monotonic()
         command = request.command.strip()
 
@@ -144,7 +144,6 @@ class CommandEvaluator:
 
         base_cmd = self._extract_base_command(command)
 
-        # Self-protection: block attempts to tamper with SafeSkillAgent
         tamper = self._check_self_protection(command)
         if tamper:
             return self._make_result(
@@ -156,7 +155,6 @@ class CommandEvaluator:
                 start_time=start,
             )
 
-        # Zero-trust allowlist gate
         if not self._trust.check_zero_trust_allowlist(base_cmd):
             return self._make_result(
                 command=command,
@@ -167,7 +165,6 @@ class CommandEvaluator:
                 start_time=start,
             )
 
-        # Strict-mode blocklist gate
         if not self._trust.check_strict_blocklist(base_cmd):
             return self._make_result(
                 command=command,
@@ -178,7 +175,6 @@ class CommandEvaluator:
                 start_time=start,
             )
 
-        # Hardcoded heuristic checks (always active, cannot be overridden)
         heuristic = self._run_heuristics(command)
         if heuristic:
             return self._make_result(
@@ -190,7 +186,6 @@ class CommandEvaluator:
                 start_time=start,
             )
 
-        # Policy rule matching
         matched_policy_rules: list[str] = []
         worst_severity: Severity | None = None
         worst_action: Action = Action.ALLOW
@@ -206,7 +201,6 @@ class CommandEvaluator:
                     worst_action = rule.action
                     worst_message = rule.message
 
-        # Signature matching
         sig_matches = self._signatures.match(command)
         matched_sigs: list[str] = []
         for sm in sig_matches:
@@ -240,7 +234,6 @@ class CommandEvaluator:
         )
 
     def _extract_base_command(self, command: str) -> str:
-        """Extract the first command/binary from a potentially complex command string."""
         stripped = command.strip()
         for prefix in ("sudo ", "nohup ", "nice ", "time ", "env ", "strace "):
             if stripped.startswith(prefix):
@@ -263,8 +256,6 @@ class CommandEvaluator:
         return None
 
     def _run_heuristics(self, command: str) -> dict[str, Any] | None:
-        """Run hardcoded heuristic checks that cannot be overridden by policy."""
-
         if self.DISK_FORMAT.search(command):
             return {
                 "rule": "HEUR-DISKFORMAT",
@@ -363,7 +354,6 @@ class CommandEvaluator:
         return None
 
     def _match_policy_rule(self, command: str, rule: PolicyRule) -> bool:
-        """Check if a command matches a policy rule's pattern."""
         try:
             if rule.pattern_type == "regex":
                 return bool(re.search(rule.pattern, command, re.IGNORECASE))

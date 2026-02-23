@@ -97,6 +97,9 @@ class AgentConfig(BaseModel):
     http_port: int = 0
     log_dir: str = "/var/log/safeskill"
     config_dir: str = "/etc/safeskill"
+    default_hostname: str = ""
+    default_user: str = ""
+    default_source_ip: str = ""
     update_url: str = ""
     update_interval_seconds: int = 3600
     auto_update: bool = False

@@ -32,12 +32,11 @@ You have a security agent running on this machine called **SafeSkillAgent**. **E
 ```
 > exec "rm -rf /"
 [SafeSkill] BLOCKED
-[SafeSkill] Severity: critical
-[SafeSkill] Reason: BLOCKED: Recursive delete of root filesystem
+[SafeSkill] BLOCKED: Recursive delete of root filesystem
 exit 126
 ```
 
-Report to the user: "That command was blocked by the security agent."
+Report: "Blocked."
 
 ### Allowed command (exec succeeds)
 

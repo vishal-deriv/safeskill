@@ -56,8 +56,8 @@ _safeskill_check() {
         logout|enable|:|exec)
             return 0
             ;;
-        # Read-only system commands
-        ls|dir|cat|head|tail|wc|sort|uniq|grep|awk|sed|cut|tr|tee|\
+        # Read-only system commands (cat excluded — daemon checks paths like /etc/passwd)
+        ls|dir|head|tail|wc|sort|uniq|grep|awk|sed|cut|tr|tee|\
         find|which|whereis|whoami|id|hostname|uname|date|cal|pwd|\
         file|stat|du|df|dirname|basename|realpath|readlink|diff|comm|\
         cmp|md5sum|sha256sum|sha1sum|env|printenv|man|info|less|more|\
@@ -65,9 +65,8 @@ _safeskill_check() {
         journalctl|dmesg|ip|ifconfig|netstat|ss|ping|dig|nslookup|host)
             return 0
             ;;
-        # Dev tools (read-only invocations pass through, mutations caught by daemon)
-        git|node|npm|npx|python3|python|pip|pip3|cargo|go|make|cmake|\
-        java|javac|mvn|gradle|ruby|gem|php|composer|dotnet)
+        # Dev tools — pip/go/make etc pass through; python/node go to daemon for eval+logging
+        git|pip|pip3|cargo|go|make|cmake|java|javac|mvn|gradle|ruby|gem|php|composer|dotnet)
             return 0
             ;;
     esac
@@ -78,16 +77,17 @@ _safeskill_check() {
         return 1
     }
 
-    # JSON-encode
-    local esc
+    # JSON-encode command and user
+    local esc user_esc
     esc=$(printf '%s' "$cmd" | python3 -c 'import sys,json;print(json.dumps(sys.stdin.buffer.read().decode("utf-8","replace")))' 2>/dev/null) || return 0
+    user_esc=$(printf '%s' "${USER:-$(whoami 2>/dev/null)}" | python3 -c 'import sys,json;print(json.dumps(sys.stdin.buffer.read().decode("utf-8","replace")))' 2>/dev/null) || echo '""'
 
     # Query daemon
     local res
-    res=$(curl -sf --max-time 2 --unix-socket "$_SS_SOCK" \
+    res=$(curl -sf --max-time 1 --unix-socket "$_SS_SOCK" \
         http://localhost/evaluate \
         -H "Content-Type: application/json" \
-        -d "{\"command\":${esc},\"source\":\"bash-trap\"}" 2>/dev/null)
+        -d "{\"command\":${esc},\"source\":\"bash-trap\",\"user\":${user_esc}}" 2>/dev/null)
 
     [[ $? -ne 0 || -z "$res" ]] && {
         echo "[SafeSkill] BLOCKED — agent unreachable" >&2
@@ -108,8 +108,7 @@ print(f"{b}|{d.get(\"verdict\",\"?\")}|{d.get(\"severity\",\"\")}|{d.get(\"messa
 
     if [[ "$blk" == "1" ]]; then
         echo "[SafeSkill] BLOCKED" >&2
-        [[ -n "$sev" ]] && echo "[SafeSkill] Severity: $sev" >&2
-        [[ -n "$msg" ]] && echo "[SafeSkill] Reason: $msg" >&2
+        [[ -n "$msg" ]] && echo "[SafeSkill] $msg" >&2
         return 1
     fi
 

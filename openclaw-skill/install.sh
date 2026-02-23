@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# SafeSkill OpenClaw Integration Installer — Production
+# SafeSkill OpenClaw Integration Installer
 #
-# Two enforcement layers:
-#   Layer 1 (Hard):  BASH_ENV trap — intercepts at bash level, LLM cannot bypass
-#   Layer 2 (Soft):  AGENTS.md injection — LLM always reads this, told to use safeskill
+# Direct interception: BASH_ENV trap intercepts every command at the shell level.
+# Blocked commands never run; the agent just sees [SafeSkill] BLOCKED.
+# No MD files, no skill checks — the trap is the gate.
 #
 # Run as the same user that runs OpenClaw (NOT root).
 
@@ -66,43 +66,50 @@ install_trap() {
 }
 
 # ================================================================
-# LAYER 2: AGENTS.MD INJECTION (LLM enforcement)
+# INJECT SECURITY INTO SOUL.MD (immutable, operator-controlled)
 # ================================================================
-inject_agents_md() {
-    log_step "Layer 2: Injecting into AGENTS.md..."
+inject_soul_security() {
+    log_step "Injecting Security section into SOUL.md..."
 
-    local agents_file="$WORKSPACE/AGENTS.md"
-    local inject_src="$SCRIPT_DIR/safeskill-inject.md"
+    local soul_file="$WORKSPACE/SOUL.md"
+    local inject_src="$SCRIPT_DIR/safeskill-soul-security.md"
 
     if [[ ! -f "$inject_src" ]]; then
-        log_error "safeskill-inject.md not found"
-        return 1
+        log_warn "safeskill-soul-security.md not found — skipping"
+        return 0
     fi
 
     mkdir -p "$WORKSPACE"
 
-    # Check if already injected
-    if [[ -f "$agents_file" ]] && grep -q "SAFESKILL SECURITY ENFORCEMENT" "$agents_file" 2>/dev/null; then
-        # Update existing injection
-        local tmp="${agents_file}.tmp.$$"
-        awk '/<!-- SAFESKILL SECURITY ENFORCEMENT/{skip=1} /<!-- END SAFESKILL -->/{skip=0;next} !skip' "$agents_file" > "$tmp"
-        cat "$inject_src" >> "$tmp"
-        mv "$tmp" "$agents_file"
-        log_info "AGENTS.md updated (replaced existing SafeSkill block)"
-    elif [[ -f "$agents_file" ]]; then
-        # Append to existing
-        echo "" >> "$agents_file"
-        cat "$inject_src" >> "$agents_file"
-        log_info "AGENTS.md injected (appended to existing)"
+    local security_block
+    security_block=$(cat "$inject_src")
+
+    if [[ -f "$soul_file" ]]; then
+        if grep -q "SAFESKILL-SECURITY" "$soul_file" 2>/dev/null; then
+            # Replace existing block with current version, keep at top
+            awk '
+                /<!-- SAFESKILL-SECURITY/{skip=1}
+                /<!-- END SAFESKILL-SECURITY -->/{skip=0;next}
+                !skip
+            ' "$soul_file" > "${soul_file}.tmp"
+            { cat "$inject_src"; echo ""; cat "${soul_file}.tmp"; } > "$soul_file"
+            rm -f "${soul_file}.tmp"
+            log_info "SOUL.md Security section updated (at start)"
+        else
+            # Inject at start — Security first
+            { cat "$inject_src"; echo ""; cat "$soul_file"; } > "${soul_file}.tmp"
+            mv "${soul_file}.tmp" "$soul_file"
+            log_info "SOUL.md Security section added at start"
+        fi
     else
-        # Create new
-        cat "$inject_src" > "$agents_file"
-        log_info "AGENTS.md created with SafeSkill enforcement"
+        cat "$inject_src" > "$soul_file"
+        echo "" >> "$soul_file"
+        log_info "SOUL.md created with Security section at start"
     fi
 }
 
 # ================================================================
-# INSTALL SKILL (so it shows up in skill list too)
+# INSTALL SKILL (optional — left for compatibility)
 # ================================================================
 install_skill() {
     log_step "Installing SafeSkill skill..."
@@ -122,6 +129,43 @@ install_skill() {
             chmod +x "$skill_dir/$f"
         fi
     done
+}
+
+# ================================================================
+# UPDATE SIEM METADATA (hostname, user, source_ip) - one-time at install
+# ================================================================
+update_siem_metadata() {
+    log_step "Updating SIEM metadata (hostname, user, source_ip)..."
+
+    local hname user ip
+    hname=$(hostname 2>/dev/null || uname -n 2>/dev/null)
+    user="${USER:-$(whoami 2>/dev/null)}"
+    [[ -z "$user" ]] && user="unknown"
+    ip=$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || true)
+    [[ -z "$ip" ]] && ip="127.0.0.1"
+
+    local agent_yaml="/etc/safeskill/agent.yaml"
+    # Use sudo for read+write if file exists (root-owned)
+    if sudo test -f "$agent_yaml" 2>/dev/null; then
+        local tmp
+        tmp=$(mktemp -t safeskill-agent.XXXXXX)
+        {
+            sudo cat "$agent_yaml" 2>/dev/null | grep -v '^default_hostname:\|^default_user:\|^default_source_ip:' || true
+            echo "default_hostname: $hname"
+            echo "default_user: $user"
+            echo "default_source_ip: $ip"
+        } > "$tmp"
+        if sudo cp "$tmp" "$agent_yaml" 2>/dev/null; then
+            sudo chmod 640 "$agent_yaml"
+            log_info "SIEM metadata updated (hostname=$hname user=$user source_ip=$ip)"
+            log_info "Restart SafeSkill daemon to apply metadata (e.g. launchctl kickstart -k system/com.safeskill.agent)"
+        else
+            log_warn "Could not write $agent_yaml"
+        fi
+        rm -f "$tmp"
+    else
+        log_warn "agent.yaml not found — run setup/install-macos.sh first for full SIEM metadata"
+    fi
 }
 
 # ================================================================
@@ -187,6 +231,52 @@ LAUNCHER
             systemctl --user set-environment SAFESKILL_SOCKET="/tmp/safeskill.sock" 2>/dev/null || true
         )
     fi
+
+    # Method E: Patch LaunchAgent plist directly (CRITICAL for interception)
+    # OpenClaw's gateway install may overwrite plist without env vars. We patch it.
+    patch_gateway_plist
+}
+
+# ================================================================
+# PATCH GATEWAY PLIST (ensures BASH_ENV in LaunchAgent env)
+# ================================================================
+patch_gateway_plist() {
+    local plist="$HOME/Library/LaunchAgents/ai.openclaw.gateway.plist"
+    if [[ ! -f "$plist" ]]; then
+        log_warn "Gateway plist not found — run 'openclaw gateway install' first, then re-run this script"
+        return 0
+    fi
+
+    python3 << PYEOF
+import plistlib
+import sys
+plist_path = "$plist"
+trap_path = "$TRAP_INSTALL_PATH"
+try:
+    with open(plist_path, "rb") as f:
+        plist = plistlib.load(f)
+    env = plist.get("EnvironmentVariables")
+    if env is None:
+        env = {}
+    elif hasattr(env, "__iter__") and not isinstance(env, dict):
+        env = dict(env)
+    env["BASH_ENV"] = trap_path
+    env["SAFESKILL_SOCKET"] = "/tmp/safeskill.sock"
+    plist["EnvironmentVariables"] = env
+    with open(plist_path, "wb") as f:
+        plistlib.dump(plist, f)
+    print("PATCHED")
+except Exception as e:
+    sys.stderr.write(f"Plist patch failed: {e}\n")
+    sys.exit(1)
+PYEOF
+
+    if [[ $? -eq 0 ]]; then
+        log_info "Gateway plist patched: BASH_ENV and SAFESKILL_SOCKET set"
+        log_info "Restart gateway to apply: openclaw gateway stop && openclaw gateway start"
+    else
+        log_warn "Could not patch gateway plist — use launcher: $OPENCLAW_HOME/start-safeskill-gateway.sh start"
+    fi
 }
 
 # ================================================================
@@ -214,17 +304,17 @@ verify() {
 
     # Check trap
     if [[ -f "$TRAP_INSTALL_PATH" ]]; then
-        log_info "Layer 1 (BASH_ENV trap): $TRAP_INSTALL_PATH"
+        log_info "BASH_ENV trap: $TRAP_INSTALL_PATH"
     else
-        log_error "Layer 1 (BASH_ENV trap): MISSING"
+        log_error "BASH_ENV trap: MISSING"
         ok=false
     fi
 
-    # Check AGENTS.md
-    if [[ -f "$WORKSPACE/AGENTS.md" ]] && grep -q "SAFESKILL" "$WORKSPACE/AGENTS.md" 2>/dev/null; then
-        log_info "Layer 2 (AGENTS.md): injected"
+    # Check SOUL.md Security section
+    if [[ -f "$WORKSPACE/SOUL.md" ]] && grep -q "SAFESKILL-SECURITY" "$WORKSPACE/SOUL.md" 2>/dev/null; then
+        log_info "SOUL.md Security section: injected"
     else
-        log_error "Layer 2 (AGENTS.md): NOT injected"
+        log_error "SOUL.md Security section: MISSING"
         ok=false
     fi
 
@@ -256,8 +346,7 @@ main() {
     echo "  SafeSkill OpenClaw Integration"
     echo "============================================"
     echo ""
-    echo "  Layer 1: BASH_ENV trap (hard enforcement)"
-    echo "  Layer 2: AGENTS.md injection (LLM instruction)"
+    echo "  Direct interception via BASH_ENV trap"
     echo ""
     echo "  OpenClaw home: $OPENCLAW_HOME"
     echo "  Workspace:     $WORKSPACE"
@@ -265,7 +354,9 @@ main() {
 
     install_trap
     echo ""
-    inject_agents_md
+    inject_soul_security
+    echo ""
+    update_siem_metadata
     echo ""
     install_skill
     echo ""
@@ -291,10 +382,15 @@ main() {
     echo ""
     echo "  Then start TUI:  openclaw tui"
     echo ""
-    echo "  ${BOLD}TEST:${NC}"
-    echo "    Tell OpenClaw: \"run rm -rf ~/tmp\""
-    echo "    Layer 1 blocks it at bash level → [SafeSkill] BLOCKED"
-    echo "    Layer 2 tells LLM to check first → safeskill check"
+    echo "  ${BOLD}VERIFY INTERCEPTION:${NC}"
+    echo "    ./openclaw-skill/verify-interception.sh"
+    echo ""
+    echo "  ${BOLD}TEST IN TUI:${NC}"
+    echo "    Tell OpenClaw: \"run rm -rf /\" or \"run cat /etc/passwd\""
+    echo "    Blocked commands → [SafeSkill] BLOCKED (never runs)"
+    echo ""
+    echo "  ${BOLD}WATCH COMMANDS IN LOG:${NC}"
+    echo "    sudo tail -f /var/log/safeskill/audit-\$(date +%Y-%m-%d).jsonl | grep evaluate"
     echo ""
     echo "============================================"
     echo ""
