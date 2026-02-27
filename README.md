@@ -162,6 +162,29 @@ sudo launchctl kickstart -k system/com.safeskill.agent
 safeskill check whoami
 ```
 
+## Uninstall
+
+**Remove SafeSkill only:**
+```bash
+sudo bash setup/uninstall-safeskill.sh
+```
+
+**Remove OpenClaw only:**
+```bash
+bash setup/uninstall-openclaw.sh
+```
+
+**Remove both:**
+```bash
+bash setup/uninstall-all.sh
+```
+
+| Script | What it removes |
+|--------|-----------------|
+| `uninstall-safeskill.sh` | Daemon, plists, binaries, /opt/safeskill, /etc/safeskill, /var/log/safeskill, /var/run/safeskill |
+| `uninstall-openclaw.sh` | Gateway process, ~/.openclaw, LaunchAgent plist, `npm uninstall -g openclaw`, shell completions |
+| `uninstall-all.sh` | Runs both scripts |
+
 ## Files
 
 ```
@@ -172,6 +195,9 @@ setup/
 ├── install.sh                 ← Step 1: Install SafeSkill daemon
 ├── start.sh                   ← Step 2: Deploy hook + restart OpenClaw
 ├── monitor-audit.sh           ← Monitor audit log
+├── uninstall-safeskill.sh     ← Remove SafeSkill (sudo)
+├── uninstall-openclaw.sh     ← Remove OpenClaw
+├── uninstall-all.sh          ← Remove both
 ├── fix-siem-config.sh         ← Fix SIEM auth header
 ├── com.safeskill.agent.plist  ← Daemon launchd config
 └── com.safeskill.updater.plist
