@@ -27,52 +27,46 @@ Allow/Block + Audit Log + SIEM Forward
 - **SIEM-ready**: All evaluations forwarded to security endpoint in real-time
 - **No OpenClaw modification**: Pure runtime monkey-patching via child_process interception
 
-## Quick Start
+## End-to-End Setup
 
-### 1. Install SafeSkill daemon
+### Prerequisites
+- Node.js 22+
+- Python 3.10+
+- macOS (LaunchAgent/LaunchDaemon)
+
+### 1. Install OpenClaw
 ```bash
-cd setup
-sudo bash finalize-install.sh
+npm install -g openclaw@latest
+openclaw onboard --install-daemon
 ```
 
-Verify:
+### 2. Install SafeSkill (two commands)
 ```bash
-launchctl list | grep safeskill
-ls -la /var/run/safeskill/
+# From the SafeSkill project directory:
+sudo bash setup/install.sh
+bash setup/start.sh
 ```
 
-### 2. Wire hook into OpenClaw
+- **install.sh**: Creates venv, installs daemon, config, launchd. Requires sudo.
+- **start.sh**: Copies hook to `~/.openclaw/`, injects NODE_OPTIONS into the gateway plist, restarts OpenClaw.
+
+### 3. Run OpenClaw TUI
 ```bash
-bash start.sh
+openclaw tui
 ```
 
-This:
-- Copies `safeskill-hook.js` → `~/.openclaw/`
-- Injects `NODE_OPTIONS=--require ~/.openclaw/safeskill-hook.js` into OpenClaw's launchd plist
-- Removes old env vars (SHELL, BASH_ENV, SAFESKILL_REAL_SHELL)
-- Restarts OpenClaw gateway
+### 4. Monitor audit log (optional)
+```bash
+sudo bash setup/monitor-audit.sh
+```
 
-### 3. Configure SIEM (optional)
+### 5. Configure SIEM (optional)
 ```bash
 # Fix auth header from old ?key= query param to x-api-key header
 sudo bash setup/fix-siem-config.sh
 
 # Verify
 sudo cat /etc/safeskill/agent.yaml | grep siem
-```
-
-### 4. Monitor audit log
-```bash
-sudo tail -f $(sudo ls -t /var/log/safeskill/audit-*.jsonl | head -1) | python3 -c "
-import sys, json
-for line in sys.stdin:
-    try:
-        d = json.loads(line)
-        if d.get('event_action') == 'evaluate':
-            print(d['event_timestamp'][:19], f\"[{d['event_outcome'].upper():7}]\", d.get('system_command', ''))
-    except:
-        pass
-"
 ```
 
 ## How the Hook Works
@@ -175,8 +169,9 @@ openclaw-skill/
 └── safeskill-hook.js          ← Core deliverable (deployed to ~/.openclaw/)
 
 setup/
-├── finalize-install.sh        ← Install SafeSkill daemon
-├── start.sh                   ← Deploy hook + restart OpenClaw
+├── install.sh                 ← Step 1: Install SafeSkill daemon
+├── start.sh                   ← Step 2: Deploy hook + restart OpenClaw
+├── monitor-audit.sh           ← Monitor audit log
 ├── fix-siem-config.sh         ← Fix SIEM auth header
 ├── com.safeskill.agent.plist  ← Daemon launchd config
 └── com.safeskill.updater.plist
