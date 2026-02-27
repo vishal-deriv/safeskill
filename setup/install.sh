@@ -56,11 +56,12 @@ fi
 "$VENV_DIR/bin/pip" install -e "$PROJECT_DIR" -q
 ok "Package installed"
 
-# ── 2. Symlink binary ───────────────────────────────────────────────────────
-step "2. Symlinking daemon binary..."
+# ── 2. Symlink binaries ─────────────────────────────────────────────────────
+step "2. Symlinking daemon and CLI binaries..."
 mkdir -p /usr/local/bin
 ln -sf "$VENV_DIR/bin/safeskill-agent" "$BIN_SYMLINK"
-ok "Symlinked $BIN_SYMLINK"
+ln -sf "$VENV_DIR/bin/safeskill" /usr/local/bin/safeskill
+ok "Symlinked $BIN_SYMLINK and /usr/local/bin/safeskill"
 
 # ── 3. Config directory ──────────────────────────────────────────────────────
 step "3. Setting up /etc/safeskill config directory..."
