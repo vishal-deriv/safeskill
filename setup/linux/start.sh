@@ -27,6 +27,68 @@ step() { echo -e "${CYAN}[>>]${NC} $*"; }
 warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
 die()  { echo -e "${RED}[ERR]${NC} $*" >&2; exit 1; }
 
+wait_user_service_active() {
+    local svc="$1"
+    local tries="${2:-12}"
+    local i
+    for ((i=1; i<=tries; i++)); do
+        if systemctl --user is-active --quiet "$svc"; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+detect_user_gateway_service() {
+    local svc_name
+    for svc_name in "openclaw-gateway-${OPENCLAW_PROFILE}" openclaw-gateway openclaw ai.openclaw.gateway; do
+        if systemctl --user cat "$svc_name" >/dev/null 2>&1 || [[ -f "$HOME/.config/systemd/user/${svc_name}.service" ]]; then
+            echo "$svc_name"
+            return 0
+        fi
+    done
+    return 1
+}
+
+service_env_has_hook() {
+    local svc="$1"
+    local env_dump
+    env_dump="$(systemctl --user show "$svc" --property=Environment --no-pager 2>/dev/null || true)"
+    [[ "$env_dump" == *"NODE_OPTIONS=--require $HOOK_DST"* ]] && \
+    [[ "$env_dump" == *"SAFESKILL_SOCKET=/var/run/safeskill/safeskill.sock"* ]]
+}
+
+read_gateway_port() {
+    local cfg="$HOME/.openclaw/openclaw.json"
+    if [[ -f "$cfg" ]] && command -v python3 >/dev/null 2>&1; then
+        python3 - <<PYPORT 2>/dev/null || echo "18799"
+import json
+import os
+p = os.path.expanduser("$cfg")
+with open(p, "r", encoding="utf-8") as f:
+    cfg = json.load(f)
+port = cfg.get("gateway", {}).get("port", 18799)
+print(int(port))
+PYPORT
+    else
+        echo "18799"
+    fi
+}
+
+is_port_listening_loopback() {
+    local port="$1"
+    if command -v ss >/dev/null 2>&1; then
+        ss -tln 2>/dev/null | grep -qE "127\.0\.0\.1:${port}\b|::1:${port}\b"
+        return $?
+    fi
+    if command -v netstat >/dev/null 2>&1; then
+        netstat -tln 2>/dev/null | grep -qE "127\.0\.0\.1\.${port}|127\.0\.0\.1:${port}|::1:${port}"
+        return $?
+    fi
+    return 2
+}
+
 echo ""
 echo "======================================="
 echo "  SafeSkill — Wire Hook into OpenClaw (Step 2 of 2)"
@@ -278,24 +340,41 @@ fi
 step "4. Restarting OpenClaw gateway..."
 
 RESTARTED=false
+ACTIVE_USER_SERVICE=""
+if SERVICE_CANDIDATE="$(detect_user_gateway_service)"; then
+    ACTIVE_USER_SERVICE="$SERVICE_CANDIDATE"
+fi
 
 if command -v openclaw &>/dev/null; then
     openclaw --profile "$OPENCLAW_PROFILE" gateway stop 2>/dev/null || true
     sleep 2
-    openclaw --profile "$OPENCLAW_PROFILE" gateway start 2>/dev/null &
-    sleep 3
-    RESTARTED=true
-    ok "Restarted via 'openclaw --profile $OPENCLAW_PROFILE' CLI"
+    START_OUT="$(openclaw --profile "$OPENCLAW_PROFILE" gateway start 2>&1 || true)"
+
+    # Some environments need gateway install before start.
+    if echo "$START_OUT" | grep -q "Gateway service disabled"; then
+        warn "Gateway service disabled for profile '$OPENCLAW_PROFILE'; attempting install..."
+        openclaw --profile "$OPENCLAW_PROFILE" gateway install >/dev/null 2>&1 || true
+        START_OUT="$(openclaw --profile "$OPENCLAW_PROFILE" gateway start 2>&1 || true)"
+    fi
+
+    if [[ -n "$ACTIVE_USER_SERVICE" ]] && wait_user_service_active "$ACTIVE_USER_SERVICE" 15; then
+        RESTARTED=true
+        ok "Restarted via 'openclaw --profile $OPENCLAW_PROFILE' CLI (service: $ACTIVE_USER_SERVICE)"
+    else
+        warn "CLI start did not confirm active user service yet; trying systemctl fallback"
+    fi
 fi
 
 if ! $RESTARTED; then
     for svc_name in "openclaw-gateway-${OPENCLAW_PROFILE}" openclaw-gateway openclaw ai.openclaw.gateway; do
         if systemctl --user is-enabled "$svc_name" &>/dev/null; then
             systemctl --user restart "$svc_name"
-            sleep 3
-            RESTARTED=true
-            ok "Restarted via systemctl --user restart $svc_name"
-            break
+            if wait_user_service_active "$svc_name" 15; then
+                RESTARTED=true
+                ACTIVE_USER_SERVICE="$svc_name"
+                ok "Restarted via systemctl --user restart $svc_name"
+                break
+            fi
         fi
     done
 fi
@@ -313,17 +392,36 @@ if ! $RESTARTED && [[ "$(id -u)" -eq 0 ]]; then
 fi
 
 if ! $RESTARTED; then
-    warn "Could not auto-restart OpenClaw gateway"
-    warn "Restart it manually so the hook takes effect"
+    die "Could not auto-restart OpenClaw gateway. Restart manually, then re-run this script."
 fi
 
-# -- 5. Verify hook ---------------------------------------------------------
-step "5. Verifying hook..."
+# -- 5. Verify gateway + hook wiring ----------------------------------------
+step "5. Verifying gateway + hook wiring..."
+
+if [[ -n "$ACTIVE_USER_SERVICE" ]]; then
+    if service_env_has_hook "$ACTIVE_USER_SERVICE"; then
+        ok "Gateway service env includes NODE_OPTIONS + SAFESKILL_SOCKET ($ACTIVE_USER_SERVICE)"
+    else
+        die "Gateway service is running but missing SafeSkill env. Check drop-in and rerun."
+    fi
+else
+    warn "Could not detect user gateway service name; skipping service env verification"
+fi
+
+GATEWAY_PORT="$(read_gateway_port)"
+if is_port_listening_loopback "$GATEWAY_PORT"; then
+    ok "Gateway listener detected on loopback port $GATEWAY_PORT"
+else
+    warn "Could not confirm listener on loopback port $GATEWAY_PORT"
+fi
+
+# -- 6. Verify daemon responsiveness ----------------------------------------
+step "6. Verifying SafeSkill daemon..."
 
 if safeskill check whoami &>/dev/null; then
     ok "SafeSkill daemon responding"
 else
-    warn "SafeSkill daemon not responding — commands will be blocked until it starts"
+    die "SafeSkill daemon not responding. Commands may fail-closed until daemon is healthy."
 fi
 
 echo ""
